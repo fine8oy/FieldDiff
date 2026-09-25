@@ -1,0 +1,59 @@
+{
+  "pretrain_datasets": [
+    "nyc_bike_manhattan",
+    "nyc_taxi",
+    "chi_bike_2024",
+    "chi_taxi_2024",
+    "toronto_bike",
+    "metr_la",
+    "pems04_benchmark_flow",
+    "pems04_benchmark_occupancy",
+    "pems04_benchmark_speed",
+    "pems08_benchmark_flow",
+    "pems08_benchmark_occupancy",
+    "pems08_benchmark_speed",
+    "largest_gba",
+    "largest_gla",
+    "pvus",
+    "air_quality_no2",
+    "air_quality_pm10",
+    "air_quality_pm25",
+    "air_quality_so2",
+    "weatherbench_2m_temperature",
+    "weatherbench_relative_humidity_700"
+  ],
+  "zero_shot_datasets": [
+    "air_quality_co",
+    "air_quality_o3",
+    "dc_bike",
+    "cmip6_mpi_historical_psl_northamerica",
+    "cmip6_mpi_historical_clt_northamerica",
+    "pems_bay",
+    "weatherbench_total_precipitation",
+    "largest_sd"
+  ],
+  "few_shot_ratios": [0.05, 0.10],
+  "training": {
+    "max_pretrain_hours": 48.0,
+    "stage1_time_fraction": 0.50
+  },
+  "tasks": [
+    "forecasting",
+    "temporal_interpolation",
+    "spatial_extrapolation",
+    "spatiotemporal_imputation"
+  ],
+  "protocol": {
+    "window_size": 24,
+    "stride": 1,
+    "eval_stride": 24,
+    "node_train_ratio": 1.0,
+    "time_train_ratio": 0.70,
+    "train_val_ratio": 0.90,
+    "forecasting_context_steps": 12,
+    "interpolation_observed_steps": 12,
+    "spatial_extrapolation_mask_ratio": 0.50,
+    "spatiotemporal_imputation_mask_ratio": 0.50,
+    "normalization_method": "standard"
+  }
+}

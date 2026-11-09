@@ -263,8 +263,16 @@ def anchored_predictions(
 ):
     diffusion.activate_batch_domain(condition_batch)
     condition = diffusion.condition_encoder(condition_batch)
-    center_latent = diffusion.condition_probe(condition.condition_grid)
-    center_normalized = diffusion.normalize(center_latent)
+    conditional_posterior = getattr(diffusion, "conditional_posterior", None)
+    if conditional_posterior is None:
+        center_latent = diffusion.condition_probe(condition.condition_grid)
+        condition_scale = None
+        center_normalized = diffusion.normalize(center_latent)
+    else:
+        center_latent, condition_scale, _ = conditional_posterior(condition)
+        # This diffusion is defined in standardized residual coordinates, so
+        # zero (not the posterior center) is its natural sampling origin.
+        center_normalized = torch.zeros_like(center_latent)
     query = build_full_query_coords(output_batch)
     center = clamp_observed(
         decode_neural_field(
@@ -275,7 +283,11 @@ def anchored_predictions(
     )
     initialization = getattr(args, "sampling_initialization", "center_noise")
     sigma_start = _sampling_sigma(diffusion, args)
-    base = center_normalized if initialization != "pure_noise" else torch.zeros_like(center_normalized)
+    base = (
+        center_normalized
+        if initialization != "pure_noise"
+        else torch.zeros_like(center_normalized)
+    )
     noises = (
         [torch.zeros_like(center_normalized)]
         if initialization == "center_zero"
@@ -286,18 +298,28 @@ def anchored_predictions(
             antithetic=not args.independent_noise,
         )
     )
+    sampled_latents = [
+        _sample_direct(
+            diffusion,
+            condition,
+            base,
+            noise,
+            sigma_start,
+            args.sampling_steps,
+        )
+        for noise in noises
+    ]
+    if condition_scale is not None:
+        compose = diffusion.compose_condition_latent
+        sampled_latents = [
+            compose(center_latent, condition_scale, residual)
+            for residual in sampled_latents
+        ]
     predictions = [
         clamp_observed(
             decode_neural_field(
                 model,
-                _sample_direct(
-                    diffusion,
-                    condition,
-                    base,
-                    noise,
-                    sigma_start,
-                    args.sampling_steps,
-                ),
+                latent,
                 query,
                 output_batch,
                 condition_batch,
@@ -305,7 +327,7 @@ def anchored_predictions(
             output_batch.values,
             observed_mask,
         )
-        for noise in noises
+        for latent in sampled_latents
     ]
     stack = torch.stack(predictions)
     return center, stack, stack.mean(dim=0), float(condition.confidence.mean())

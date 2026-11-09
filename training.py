@@ -20,10 +20,16 @@ from torch.utils.data import Subset
 from .training_helpers import (
     anchored_predictions,
     count_parameters,
+    denormalize_values_for_batch,
     evaluate_validation,
     module_gradient_norm,
     run_stage1_validation,
     set_global_seed,
+)
+from stfm.probabilistic_metrics import (
+    finalize_ensemble_totals,
+    new_ensemble_totals,
+    update_ensemble_totals,
 )
 from .model.common import (
     BalancedDomainIterator,
@@ -218,6 +224,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-batches-per-domain", type=int, default=1)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--max-eval-batches", type=int, default=200)
+    parser.add_argument(
+        "--eval-tasks",
+        type=str,
+        default=None,
+        help="Comma-separated evaluation-only task subset; training still uses all four tasks.",
+    )
     parser.add_argument("--save-few-shot-checkpoints", action="store_true")
 
     parser.add_argument("--window-size", type=int, default=None)
@@ -303,6 +315,11 @@ def make_protocol(args: argparse.Namespace) -> Protocol:
 
 
 def validate_args(args: argparse.Namespace) -> torch.device:
+    requested_eval_tasks = parse_csv(args.eval_tasks)
+    unknown_eval_tasks = sorted(set(requested_eval_tasks) - set(TASKS))
+    if unknown_eval_tasks:
+        raise ValueError(f"Unknown --eval-tasks entries: {unknown_eval_tasks}; expected a subset of {TASKS}")
+    args.resolved_eval_tasks = requested_eval_tasks or list(TASKS)
     if args.smoke_test:
         args.stage1_epochs = args.stage2_epochs = args.few_shot_epochs = 1
         args.steps_per_epoch = args.few_shot_steps_per_epoch = 2
@@ -561,7 +578,12 @@ def stage2_train_epoch(
         task = CONDITIONAL_TASKS[((step // num_domains) + epoch - 1) % len(CONDITIONAL_TASKS)]
         optimizer.zero_grad(set_to_none=True)
         with torch.no_grad():
-            target_latent = model.encode(batch)
+            encode_posterior = getattr(model, "encode_posterior", None)
+            if encode_posterior is None:
+                target_latent = model.encode(batch)
+                target_logvar = None
+            else:
+                target_latent, target_logvar = encode_posterior(batch)
         output = diffusion.loss_for_task(
             target_latent,
             batch,
@@ -574,6 +596,7 @@ def stage2_train_epoch(
             shuffle_loss_weight=args.shuffle_loss_weight,
             shuffle_margin=args.shuffle_margin,
             compute_shuffle_loss=args.shuffle_every > 0 and step % args.shuffle_every == 0,
+            target_logvar=target_logvar,
         )
         output.loss.backward()
         if step == 0:
@@ -1083,19 +1106,31 @@ def evaluate_task(field, diffusion, domain, spec, task, args, device):
         else "anchored_ensemble"
     )
     totals = {"deterministic_center": new_totals(), ensemble_method: new_totals()}
+    probabilistic_totals = new_ensemble_totals()
     field.eval(); diffusion.eval()
     task_index = TASKS.index(task)
     for batch_index, batch in enumerate(loader):
         batch = move_batch_to_device(batch, device)
         condition = merge_test_condition_preserving_domain(batch)
         eval_mask = batch.metadata.get("eval_mask", valid_mask_for_batch(batch))
-        center, _, ensemble, _ = anchored_predictions(
+        center, stack, ensemble, _ = anchored_predictions(
             field, diffusion, condition, batch, args,
             args.seed + 900000 + task_index * 10000 + batch_index * 100,
             batch.obs_mask,
         )
         update_totals(totals["deterministic_center"], center, batch.values, eval_mask, batch)
         update_totals(totals[ensemble_method], ensemble, batch.values, eval_mask, batch)
+        original_samples = torch.stack(
+            [denormalize_values_for_batch(sample, batch) for sample in stack]
+        )
+        original_target = denormalize_values_for_batch(batch.values, batch)
+        update_ensemble_totals(
+            probabilistic_totals,
+            original_samples,
+            original_target,
+            eval_mask,
+            batch.metadata["value_scale"],
+        )
     result = {}
     for method, values in totals.items():
         count = max(values["count"], 1.0)
@@ -1106,6 +1141,7 @@ def evaluate_task(field, diffusion, domain, spec, task, args, device):
             "rmse": math.sqrt(mse),
             "count": int(values["count"]),
         }
+    result["probabilistic"] = finalize_ensemble_totals(probabilistic_totals)
     return result
 
 
@@ -1118,7 +1154,7 @@ def evaluate_group(field, diffusion, names, regime, store, args, device, path, l
     rows = []
     for name in names:
         domain, spec = store.get(name), store.spec(name)
-        for task in TASKS:
+        for task in args.resolved_eval_tasks:
             methods = evaluate_task(field, diffusion, domain, spec, task, args, device)
             primary_method = (
                 "standard_noise_ensemble"
@@ -1126,9 +1162,10 @@ def evaluate_group(field, diffusion, names, regime, store, args, device, path, l
                 else "anchored_ensemble"
             )
             primary = methods[primary_method]
+            probabilistic = methods["probabilistic"]
             row = {
                 "regime": regime, "few_shot_ratio": ratio, "dataset": name, "task": task,
-                **primary, "primary_method": primary_method, "methods": methods,
+                **primary, **probabilistic, "primary_method": primary_method, "methods": methods,
             }
             if extra:
                 row.update(extra)
@@ -1227,7 +1264,10 @@ def write_csv(jsonl_path: Path, csv_path: Path) -> list[dict]:
     rows = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     fields = [
         "regime", "few_shot_ratio", "dataset", "task", "primary_method",
-        "mae", "mse", "rmse", "count", "few_shot_budget",
+        "mae", "mse", "rmse", "crps", "normalized_crps", "ensemble_std",
+        "coverage_80", "interval_width_80", "interval_score_80",
+        "coverage_90", "interval_width_90", "interval_score_90",
+        "mean_interval_calibration_error", "count", "probabilistic_count", "few_shot_budget",
     ]
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
@@ -1238,8 +1278,14 @@ def write_csv(jsonl_path: Path, csv_path: Path) -> list[dict]:
 def macro_summary(rows: Sequence[dict]) -> dict:
     grouped: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     for row in rows:
-        for key in ("mae", "mse", "rmse"):
-            grouped[row["regime"]][key].append(float(row[key]))
+        for key in (
+            "mae", "mse", "rmse", "crps", "normalized_crps", "ensemble_std",
+            "coverage_80", "interval_width_80", "interval_score_80",
+            "coverage_90", "interval_width_90", "interval_score_90",
+            "mean_interval_calibration_error",
+        ):
+            if key in row:
+                grouped[row["regime"]][key].append(float(row[key]))
     return {
         regime: {key: float(np.mean(values)) for key, values in metrics.items()}
         for regime, metrics in grouped.items()
@@ -1284,6 +1330,7 @@ def main() -> None:
         "zero_shot_datasets": zero_names,
         "few_shot_ratios": ratios,
         "tasks": TASKS,
+        "evaluation_tasks": args.resolved_eval_tasks,
         "protocol": asdict(protocol),
         "pretrain_scale_contract": {
             "scale": args.pretrain_time_scale,

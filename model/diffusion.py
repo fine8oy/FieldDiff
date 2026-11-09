@@ -1171,6 +1171,7 @@ class StructuredDirectLatentDiffusion(nn.Module):
         shuffle_loss_weight: float = 0.05,
         shuffle_margin: float = 0.05,
         compute_shuffle_loss: bool = False,
+        target_logvar: Optional[torch.Tensor] = None,
     ) -> DirectDiffusionLossOutput:
         condition_batch = build_condition_view(full_batch, task, task_config, generator=generator)
         condition = self.condition_encoder(condition_batch)
@@ -1789,6 +1790,19 @@ class ValueAnchoredConditionEncoder(ValueCanonicalConditionEncoder):
         )
 
 class ValueAnchoredDirectDiffusion(ValueCanonicalDirectDiffusion):
+    """Conditional residual EDM reusing the frozen Stage-1 VAE posterior.
+
+    The condition encoder first produces a grid in the Stage-1 latent feature
+    space.  The exact posterior heads learned by Stage 1 then map that grid to
+    a conditional mean and scale.  EDM operates on the standardized unresolved
+    residual ``(z_full - mean_c) / scale_c`` rather than on the raw latent.
+
+    The first four channels are deterministic analytic value anchors.  Their
+    conditional centers are reused, but their diffusion scale is fixed to one;
+    the deliberately tiny VAE variance assigned to those channels must not be
+    used as a numerical divisor.
+    """
+
     def __init__(self, config, neural_field, domain_feature_dim, **kwargs) -> None:
         super().__init__(config, neural_field, domain_feature_dim, **kwargs)
         self.condition_encoder = ValueAnchoredConditionEncoder(
@@ -1799,6 +1813,307 @@ class ValueAnchoredDirectDiffusion(ValueCanonicalDirectDiffusion):
             axial_layers=int(kwargs.get("condition_axial_layers", 2)),
             heads=config.self_heads,
             confidence_bandwidth=float(kwargs.get("confidence_bandwidth", 0.25)),
+        )
+        if not isinstance(neural_field, AnchorAffineValueAnchoredFoundationField):
+            raise TypeError(
+                "ValueAnchoredDirectDiffusion requires the Stage-1 anchor-affine VAE"
+            )
+
+        # Keep the legacy module in state dicts so old checkpoints remain
+        # loadable, but remove the independently learned Stage-2 latent probe
+        # from the active condition-to-posterior path.
+        self.condition_probe.requires_grad_(False)
+
+    def conditional_posterior(
+        self, condition: DirectConditionOutput
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return Stage-1 posterior center, effective scale and raw logvar."""
+
+        center, logvar = self.neural_field.posterior_parameters_from_latent(
+            condition.condition_grid
+        )
+        residual_scale = torch.exp(
+            0.5 * logvar[..., VALUE_ANCHOR_DIM:]
+        ).clamp_min(1e-4)
+        scale = torch.cat(
+            [
+                torch.ones_like(center[..., :VALUE_ANCHOR_DIM]),
+                residual_scale,
+            ],
+            dim=-1,
+        )
+        return center, scale, logvar
+
+    @staticmethod
+    def compose_condition_latent(
+        center: torch.Tensor,
+        scale: torch.Tensor,
+        standardized_residual: torch.Tensor,
+    ) -> torch.Tensor:
+        return center + scale * standardized_residual
+
+    def loss_for_task(
+        self,
+        target_latent: torch.Tensor,
+        full_batch: STBatch,
+        task: STTask,
+        task_config: CurrentConditionalTaskConfig,
+        generator: Optional[torch.Generator] = None,
+        decoded_loss_weight: float = 0.05,
+        condition_latent_loss_weight: float = 0.25,
+        condition_decoded_loss_weight: float = 0.05,
+        shuffle_loss_weight: float = 0.05,
+        shuffle_margin: float = 0.05,
+        compute_shuffle_loss: bool = False,
+        target_logvar: Optional[torch.Tensor] = None,
+    ) -> DirectDiffusionLossOutput:
+        condition_batch = build_condition_view(
+            full_batch, task, task_config, generator=generator
+        )
+        condition = self.condition_encoder(condition_batch)
+        center, scale, condition_logvar = self.conditional_posterior(condition)
+
+        if target_logvar is None:
+            # Compatibility for direct callers outside the shared Stage-2
+            # trainer. The field is frozen, so this supplies a supervision
+            # target without creating Stage-1 parameter gradients.
+            with torch.no_grad():
+                _, target_logvar = self.neural_field.posterior_parameters(full_batch)
+        if target_logvar.shape != target_latent.shape:
+            raise ValueError(
+                "Stage-1 target posterior mean/logvar shapes must match: "
+                f"{tuple(target_latent.shape)} vs {tuple(target_logvar.shape)}"
+            )
+
+        # Detaching the affine frame prevents EDM from shrinking its own target
+        # by inflating scale. The conditional posterior is instead trained by
+        # the explicit full-to-condition Gaussian KL below.
+        target_residual = (target_latent - center.detach()) / scale.detach()
+        latent_weight = 1.0 + self.missing_loss_weight * (
+            1.0 - condition.confidence
+        )
+
+        rnd_normal = torch.randn(
+            target_latent.shape[0],
+            device=target_latent.device,
+            dtype=target_latent.dtype,
+        )
+        sigma = (rnd_normal * self.config.p_std + self.config.p_mean).exp()
+        noisy = target_residual + torch.randn_like(target_residual) * append_dims(
+            sigma, target_residual.ndim
+        )
+        denoise_condition = (
+            condition
+            if compute_shuffle_loss
+            else self._drop_condition_samples(condition)
+        )
+        denoised_residual = self.denoise(noisy, sigma, denoise_condition)
+        edm_weight = (sigma.square() + self.config.sigma_data**2) / (
+            sigma * self.config.sigma_data
+        ).square()
+        edm_element = (denoised_residual - target_residual).square().mean(dim=-1)
+        weighted = (
+            append_dims(edm_weight, edm_element.ndim)
+            * edm_element
+            * latent_weight
+        )
+        edm_loss = weighted.sum() / latent_weight.sum().clamp_min(1.0)
+
+        valid = torch.ones_like(condition_batch.obs_mask)
+        if full_batch.node_mask is not None:
+            valid = valid * full_batch.node_mask[:, None, :].to(valid.dtype)
+        natural_valid = full_batch.metadata.get("valid_mask")
+        if natural_valid is not None:
+            valid = valid * natural_valid.to(valid.dtype)
+        missing_mask = valid * (1.0 - condition_batch.obs_mask)
+
+        low_sigma = sigma <= 1.0
+        if low_sigma.any() and decoded_loss_weight > 0:
+            predicted_latent = self.compose_condition_latent(
+                center[low_sigma],
+                scale[low_sigma],
+                denoised_residual[low_sigma],
+            )
+            query = build_full_query_coords(full_batch)[low_sigma]
+            selected_full = _slice_batch_rows(full_batch, low_sigma)
+            selected_condition = _slice_batch_rows(condition_batch, low_sigma)
+            prediction = decode_neural_field(
+                self.neural_field,
+                predicted_latent,
+                query,
+                selected_full,
+                selected_condition,
+            )
+            decoded_loss = self._masked_value_l1(
+                prediction,
+                full_batch.values[low_sigma],
+                missing_mask[low_sigma],
+            )
+        else:
+            decoded_loss = target_latent.new_zeros(())
+
+        # The analytic anchors have no learned posterior variance, so supervise
+        # only their centers. Learned residual channels use KL(q_full || q_c),
+        # which identifies both conditional mean and conditional scale and
+        # prevents a degenerate arbitrary affine frame for residual diffusion.
+        anchor_center_error = F.smooth_l1_loss(
+            center[..., :VALUE_ANCHOR_DIM],
+            target_latent[..., :VALUE_ANCHOR_DIM],
+            reduction="none",
+        ).mean(dim=-1)
+        full_residual_mean = target_latent[..., VALUE_ANCHOR_DIM:].detach()
+        full_residual_logvar = target_logvar[
+            ..., VALUE_ANCHOR_DIM:
+        ].detach()
+        condition_residual_mean = center[..., VALUE_ANCHOR_DIM:]
+        condition_residual_logvar = condition_logvar[..., VALUE_ANCHOR_DIM:]
+        posterior_kl = 0.5 * (
+            condition_residual_logvar
+            - full_residual_logvar
+            + (
+                full_residual_logvar.exp()
+                + (full_residual_mean - condition_residual_mean).square()
+            )
+            / condition_residual_logvar.exp().clamp_min(1e-8)
+            - 1.0
+        )
+        condition_latent_element = anchor_center_error + posterior_kl.mean(dim=-1)
+        condition_latent_loss = (
+            condition_latent_element * latent_weight
+        ).sum() / latent_weight.sum().clamp_min(1.0)
+
+        if condition_decoded_loss_weight > 0:
+            condition_prediction = decode_neural_field(
+                self.neural_field,
+                center,
+                build_full_query_coords(full_batch),
+                full_batch,
+                condition_batch,
+            )
+            condition_decoded_loss = self._masked_value_l1(
+                condition_prediction,
+                full_batch.values,
+                missing_mask,
+            )
+        else:
+            condition_decoded_loss = target_latent.new_zeros(())
+
+        shuffle_loss = target_latent.new_zeros(())
+        condition_advantage = target_latent.new_zeros(())
+        shuffle_applied = target_latent.new_zeros(())
+        if (
+            compute_shuffle_loss
+            and shuffle_loss_weight > 0
+            and target_latent.shape[0] > 1
+        ):
+            shuffled_denoised = self.denoise(
+                noisy, sigma, self._roll_condition(condition)
+            )
+            correct_error = (denoised_residual - target_residual).square().mean(
+                dim=(1, 2, 3)
+            )
+            shuffled_error = (shuffled_denoised - target_residual).square().mean(
+                dim=(1, 2, 3)
+            )
+            condition_advantage = (shuffled_error - correct_error).mean()
+            shuffle_loss = F.relu(
+                shuffle_margin + correct_error - shuffled_error
+            ).mean()
+            shuffle_applied = target_latent.new_ones(())
+
+        missing_latent = condition.confidence < 0.5
+        missing_confidence = (
+            condition.confidence[missing_latent].mean()
+            if missing_latent.any()
+            else condition.confidence.new_ones(())
+        )
+        residual_scale = scale[..., VALUE_ANCHOR_DIM:]
+        return DirectDiffusionLossOutput(
+            loss=(
+                edm_loss
+                + decoded_loss_weight * decoded_loss
+                + condition_latent_loss_weight * condition_latent_loss
+                + condition_decoded_loss_weight * condition_decoded_loss
+                + shuffle_loss_weight * shuffle_loss
+            ),
+            edm_loss=edm_loss,
+            decoded_loss=decoded_loss,
+            condition_latent_loss=condition_latent_loss,
+            condition_decoded_loss=condition_decoded_loss,
+            shuffle_loss=shuffle_loss,
+            condition_advantage=condition_advantage,
+            shuffle_applied=shuffle_applied,
+            mean_sigma=sigma.mean(),
+            mean_confidence=condition.confidence.mean(),
+            missing_confidence=missing_confidence,
+            target_abs_mean=target_residual.abs().mean(),
+            task=task.value,
+            mean_uncertainty=residual_scale.mean(),
+        )
+
+    @torch.no_grad()
+    def sample_conditional(
+        self,
+        condition_batch: STBatch,
+        final_query_coords: Optional[torch.Tensor] = None,
+        num_steps: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, DirectConditionOutput]:
+        condition = self.condition_encoder(condition_batch)
+        center, scale, _ = self.conditional_posterior(condition)
+        null_condition = (
+            self._null_condition(condition) if self.guidance_scale != 1.0 else None
+        )
+        x_next = torch.randn_like(center) * self.config.sigma_max
+        steps = self.karras_schedule(
+            x_next.device, x_next.dtype, num_steps=num_steps
+        )
+        for index, (current, following) in enumerate(zip(steps[:-1], steps[1:])):
+            sigma = x_next.new_full((x_next.shape[0],), current)
+            denoised = self.denoise(x_next, sigma, condition)
+            if null_condition is not None:
+                unconditional = self.denoise(x_next, sigma, null_condition)
+                denoised = unconditional + self.guidance_scale * (
+                    denoised - unconditional
+                )
+            derivative = (x_next - denoised) / current.clamp_min(
+                self.config.sigma_min
+            )
+            euler = x_next + (following - current) * derivative
+            if index < len(steps) - 2 and following > 0:
+                next_sigma = x_next.new_full((x_next.shape[0],), following)
+                next_denoised = self.denoise(euler, next_sigma, condition)
+                if null_condition is not None:
+                    next_unconditional = self.denoise(
+                        euler, next_sigma, null_condition
+                    )
+                    next_denoised = next_unconditional + self.guidance_scale * (
+                        next_denoised - next_unconditional
+                    )
+                next_derivative = (
+                    euler - next_denoised
+                ) / following.clamp_min(self.config.sigma_min)
+                x_next = x_next + 0.5 * (following - current) * (
+                    derivative + next_derivative
+                )
+            else:
+                x_next = euler
+
+        final_latent = self.compose_condition_latent(center, scale, x_next)
+        query = (
+            build_full_query_coords(condition_batch)
+            if final_query_coords is None
+            else final_query_coords
+        )
+        return (
+            final_latent,
+            decode_neural_field(
+                self.neural_field,
+                final_latent,
+                query,
+                condition_batch,
+                condition_batch,
+            ),
+            condition,
         )
 
 

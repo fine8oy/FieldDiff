@@ -2473,6 +2473,19 @@ class AnchorAffineValueAnchoredFoundationField(
             torch.cat([anchor_logvar, residual_logvar], dim=-1),
         )
 
+    def posterior_parameters_from_latent(
+        self, base_latent: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply the frozen Stage-1 VAE posterior heads to an aligned grid.
+
+        Unlike :meth:`posterior_parameters`, this entry point does not run the
+        full-value encoder and does not overwrite the cached full posterior.
+        Stage 2 uses it to map its Stage-1-aligned condition grid into the same
+        posterior mean/log-variance coordinate system as the target latent.
+        """
+
+        return self._posterior_parameters_from_latent(base_latent)
+
     def posterior_parameters(
         self, batch: STBatch
     ) -> tuple[torch.Tensor, torch.Tensor]:
